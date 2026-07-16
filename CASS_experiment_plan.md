@@ -1,283 +1,433 @@
-# Correction-Aware SSD Scheduling（CASS）实验设计
+# CASS：Correction-Aware SSD Scheduling 实验任务说明
 
-## 1. 实验目标
+## 1. 目标
 
-验证 CASS 是否能够在发生 correction read 时，通过重叠 SSD I/O 与 Ready Block 的 Attention 计算，降低：
+实现并验证 **Correction-Aware SSD Scheduling（CASS）**。
 
-- I/O Blocking Time
-- 单步 Decode Latency
-- 端到端推理延迟
+CASS 面向动态稀疏 Attention 的预取失误场景：
 
-核心判断标准：
+- 已命中的 KV Blocks 已经位于 GPU 或可立即使用；
+- 漏预测的 KV Blocks 需要从 SSD 执行 correction read；
+- CASS 在 correction read 进行期间，先计算 Ready Blocks；
+- correction blocks 到达后继续计算，并通过 online softmax 合并结果。
 
-\[
-T_{CASS} < T_{Baseline}
-\]
+需要回答的核心问题：
 
-并且：
-
-\[
-	ext{被隐藏的 I/O 时间} > 	ext{额外调度与合并开销}
-\]
+> CASS 是否能够减少 correction read 引起的 GPU 等待，并降低单步 decode latency？
 
 ---
 
-## 2. 对比方案
+## 2. 核心对比方案
 
-### Baseline：Wait-All
+必须实现以下三种模式。
 
-流程：
+### 2.1 Wait-All Baseline
 
 ```text
 发起 correction read
-        ↓
-等待所有 correction blocks 到达
-        ↓
-统一执行 Attention
+→ 等待全部 correction blocks 到达
+→ 对全部选中 blocks 一次性计算 Attention
 ```
 
-### CASS
-
-流程：
+### 2.2 Async-I/O Baseline
 
 ```text
-识别 Ready Blocks 与 Correction Blocks
-        ↓
-同时执行
-├─ GPU：计算 Ready Blocks
-└─ SSD：读取 Correction Blocks
-        ↓
-Correction Blocks 到达
-        ↓
-增量计算并通过 online softmax 合并
+异步发起 correction read
+→ 仍然等待全部 blocks 到达
+→ 一次性计算 Attention
 ```
 
-### Oracle
+用于排除“收益仅来自异步 I/O”的可能。
 
-假设所有需要的 KV Blocks 均已提前到达 GPU，用作理论延迟下界。
+### 2.3 CASS
+
+```text
+识别 Ready Blocks 和 Correction Blocks
+→ 同时执行：
+   1. GPU 计算 Ready Blocks
+   2. SSD 读取 Correction Blocks
+→ Correction Blocks 到达
+→ 继续计算
+→ 使用 online softmax 合并
+```
+
+可额外提供 Oracle：
+
+```text
+假设所有 blocks 已提前就绪
+```
+
+作为延迟下界。
 
 ---
 
-## 3. 控制变量
+## 3. 实现范围
 
-Baseline 与 CASS 必须保持以下条件一致：
+第一阶段只做可控实验，不直接修改完整 llama.cpp 推理流程。
 
-- 相同 Query
-- 相同 KV 数据
-- 相同真实 Selected Blocks
-- 相同 Ready / Correction 划分
-- 相同 SSD 延迟
-- 相同 Block Size
-- 相同 Attention Kernel
-- 相同硬件与运行环境
+优先实现：
 
-实验中只改变调度策略。
+```text
+core/
+  attention_state.*
+  block_state.*
+  cass_scheduler.*
+
+harness/
+  mock_ssd.*
+  experiment_runner.*
+  trace_recorder.*
+  metrics.*
+
+tests/
+  test_online_softmax.*
+  test_scheduler.*
+  test_correctness.*
+```
+
+要求：
+
+1. 每个核心模块必须有单元测试；
+2. 所有调度事件必须写入 trace；
+3. 每次实验必须输出 JSON metrics；
+4. 固定随机种子，保证结果可复现；
+5. 第一阶段允许使用 mock SSD latency；
+6. 第一阶段不实现完整模型推理。
 
 ---
 
-## 4. 实验变量
+## 4. 正确性要求
 
-### 4.1 Ready Block 数量
+CASS 不能直接相加两个局部 softmax 输出。
 
-```text
-2、4、8、16
-```
-
-### 4.2 Correction Block 数量
+必须维护 online softmax 状态：
 
 ```text
-1、2、4、8
+m：当前最大 score
+l：指数和
+o：未归一化输出累积
 ```
 
-### 4.3 SSD 读取延迟
+Ready Blocks 和 Correction Blocks 分别计算后，通过 online softmax 合并。
+
+至少验证：
 
 ```text
-100 μs、300 μs、500 μs、1000 μs
+max_abs_error
+mean_abs_error
+relative_error
 ```
 
-### 4.4 Block Size
+比较对象：
 
 ```text
-16、32、64、128 tokens
+CASS 输出 vs Wait-All 输出
 ```
 
-### 4.5 Correction Block 到达模式
+建议：
 
-- 同时到达
-- 均匀到达
-- 随机到达
+- score 最大值和 softmax 归一化状态使用 FP32；
+- 第一阶段先使用 FP32 验证；
+- 后续再测试 FP16 / BF16。
 
 ---
 
-## 5. 核心指标
+## 5. 实验变量
 
-### 5.1 Decode Latency
+至少覆盖以下参数。
 
-单轮 decode 的完整执行时间。
-
-### 5.2 I/O Blocking Time
-
-GPU 因等待 correction blocks 而空闲的时间。
-
-### 5.3 Overlap Ratio
-
-\[
-	ext{Overlap Ratio}
-=
-rac{	ext{被 Attention 计算覆盖的 I/O 时间}}
-{	ext{总 correction I/O 时间}}
-\]
-
-### 5.4 额外开销
-
-记录：
-
-- kernel 启动次数
-- online softmax 合并时间
-- 状态保存与恢复时间
-- CUDA event / stream 同步时间
-- 调度器执行时间
-
-### 5.5 正确性指标
-
-对比 Baseline 与 CASS 输出：
-
-\[
-	ext{Max Error}
-=
-\max |O_{CASS}-O_{Baseline}|
-\]
-
-同时记录平均绝对误差和相对误差。
-
----
-
-## 6. 实验流程
+### Ready Block 数量
 
 ```text
-生成固定 Attention Trace
-        ↓
-人为指定 Ready / Correction Blocks
-        ↓
-分别运行 Baseline、CASS、Oracle
-        ↓
-每组实验重复 50～100 次
-        ↓
-统计平均值、P50、P95
+2, 4, 8, 16
 ```
 
-第一阶段使用 mock SSD latency。
-
-第二阶段接入真实：
+### Correction Block 数量
 
 ```text
-liburing + NVMe SSD + CUDA Stream
+1, 2, 4, 8
+```
+
+### Block Size
+
+```text
+16, 32, 64, 128 tokens
+```
+
+### SSD 延迟
+
+```text
+100, 300, 500, 1000 us
+```
+
+### Correction Block 到达方式
+
+```text
+all_at_once
+uniform
+random
+```
+
+第一轮快速验证可以固定：
+
+```text
+block_size = 64
+ready_blocks = [2, 4, 8]
+correction_blocks = [1, 2, 4]
+ssd_latency_us = [300, 500, 1000]
 ```
 
 ---
 
-## 7. 消融实验
+## 6. 必须记录的指标
 
-### 7.1 仅启用异步 I/O
+每组实验至少记录：
 
-异步发起 correction read，但仍等待所有 Block 到齐后统一计算。
+```text
+total_latency_us
+attention_latency_us
+io_latency_us
+io_blocking_time_us
+ready_attention_time_us
+correction_attention_time_us
+merge_time_us
+scheduler_overhead_us
+kernel_launch_count
+overlap_time_us
+overlap_ratio
+max_abs_error
+```
 
-目的：证明收益不是单纯来自异步 I/O。
+其中：
 
-### 7.2 CASS 不使用 Micro-batching
+```text
+overlap_ratio =
+overlap_time_us / io_latency_us
+```
 
-每到达一个 correction block，就立即启动一次 Attention Kernel。
+加速比：
 
-### 7.3 CASS 使用 Micro-batching
-
-多个 correction blocks 到达后聚合计算。
-
-目的：验证 kernel 启动与同步开销是否抵消收益。
-
-### 7.4 移除 Online Softmax 增量合并
-
-等待所有块到齐后统一计算。
-
-目的：验证分阶段计算本身带来的收益。
+```text
+speedup =
+baseline_total_latency / cass_total_latency
+```
 
 ---
 
-## 8. 最小实验矩阵
+## 7. Trace 事件
 
-| Ready Blocks | Correction Blocks | SSD 延迟 | Block Size |
+每次实验至少记录以下事件：
+
+```text
+experiment_start
+selection_done
+correction_io_submit
+ready_attention_start
+ready_attention_end
+correction_block_arrive
+correction_attention_start
+correction_attention_end
+online_merge_start
+online_merge_end
+experiment_end
+```
+
+每个事件包含：
+
+```json
+{
+  "event": "ready_attention_start",
+  "timestamp_us": 0,
+  "layer": 0,
+  "block_ids": [1, 2, 3]
+}
+```
+
+---
+
+## 8. 实验流程
+
+### Phase 1：数学正确性
+
+1. 生成固定的 Q、K、V；
+2. 随机划分 Ready Blocks 和 Correction Blocks；
+3. 分别运行 Wait-All 和 CASS；
+4. 比较输出误差；
+5. 单元测试必须通过。
+
+### Phase 2：Mock SSD 实验
+
+1. 使用 sleep、定时器或事件模拟 SSD 延迟；
+2. 实现 Wait-All、Async-I/O 和 CASS；
+3. 扫描实验变量；
+4. 每组重复 50 次；
+5. 输出均值、P50、P95。
+
+### Phase 3：真实 SSD 实验
+
+1. 使用 liburing 发起异步读取；
+2. 使用 pinned memory 作为中间缓冲区；
+3. 使用 CUDA stream 和 event 管理传输与计算；
+4. 验证 SSD I/O 与 GPU 计算是否真实重叠；
+5. 记录 GPU、CPU、SSD 资源占用。
+
+### Phase 4：端到端集成
+
+仅在前三个阶段验证有效后执行：
+
+1. 接入现有 SolidAttention harness；
+2. 使用真实 Block Selection Trace；
+3. 对比原始调度器与 CASS；
+4. 统计每 token decode latency。
+
+---
+
+## 9. 最关键的实验
+
+必须优先完成以下对比：
+
+| Ready Blocks | Correction Blocks | SSD Latency | Block Size |
 |---:|---:|---:|---:|
-| 8 | 1 | 300 μs | 64 |
-| 8 | 2 | 500 μs | 64 |
-| 4 | 4 | 500 μs | 64 |
-| 2 | 8 | 1000 μs | 64 |
+| 8 | 1 | 300 us | 64 |
+| 8 | 2 | 500 us | 64 |
+| 4 | 4 | 500 us | 64 |
+| 2 | 8 | 1000 us | 64 |
 
-优先完成以上四组，即可初步判断 CASS 的有效区间。
+需要输出：
+
+```text
+Wait-All latency
+Async-I/O latency
+CASS latency
+CASS speedup
+I/O blocking reduction
+scheduler overhead
+correctness error
+```
 
 ---
 
-## 9. 成功标准
+## 10. 成功标准
 
-CASS 被认为有效，需要满足：
+CASS 被认为有效，需要同时满足：
 
-1. 平均 Decode Latency 低于 Baseline
-2. P95 延迟不明显恶化
-3. I/O Blocking Time 明显下降
-4. 输出误差处于浮点容差范围内
-5. 节省时间大于额外调度与合并开销
+1. CASS 输出与 Wait-All 输出在浮点容差内一致；
+2. CASS 的平均 latency 低于 Wait-All；
+3. I/O blocking time 明显下降；
+4. P95 latency 不明显恶化；
+5. 调度和合并开销小于被隐藏的 I/O 时间；
+6. 至少找到一组稳定有效的运行区间。
 
 建议目标：
 
 ```text
-平均 Decode Latency 降低 ≥ 10%
-I/O Blocking Time 降低 ≥ 20%
+decode latency reduction >= 10%
+io blocking reduction >= 20%
+```
+
+如果没有达到目标，也必须给出：
+
+- CASS 失效的参数范围；
+- 额外开销来源；
+- Ready Block 计算不足的原因；
+- 是否需要 micro-batching。
+
+---
+
+## 11. 消融实验
+
+至少完成以下消融：
+
+```text
+Wait-All
+Async-I/O only
+CASS without micro-batching
+CASS with micro-batching
+```
+
+Micro-batching 可测试：
+
+```text
+batch_size = 1, 2, 4, 8 blocks
+```
+
+用于判断每个 block 单独启动 kernel 是否导致额外开销过大。
+
+---
+
+## 12. 输出文件
+
+建议输出目录：
+
+```text
+outputs/
+  env/
+    hardware.txt
+    software.txt
+
+  traces/
+    *.jsonl
+
+  metrics/
+    *.json
+
+  logs/
+    *.log
+
+  figures/
+    latency_vs_io.pdf
+    speedup_vs_correction_blocks.pdf
+    overlap_ratio.pdf
+    overhead_breakdown.pdf
+
+  reports/
+    cass_summary.md
+```
+
+每组实验的 JSON 至少包含：
+
+```json
+{
+  "mode": "cass",
+  "ready_blocks": 8,
+  "correction_blocks": 2,
+  "block_size": 64,
+  "ssd_latency_us": 500,
+  "total_latency_us": 0,
+  "io_blocking_time_us": 0,
+  "overlap_ratio": 0,
+  "speedup": 0,
+  "max_abs_error": 0
+}
 ```
 
 ---
 
-## 10. 建议绘制的图表
+## 13. 一键运行要求
 
-### 图 1：SSD 延迟与 Decode Latency
+最终提供：
 
-- 横轴：Correction I/O Latency
-- 纵轴：End-to-End Decode Latency
-- 曲线：Baseline、CASS、Oracle
+```bash
+bash scripts/setup.sh
+bash scripts/run_unit_tests.sh
+bash scripts/run_mock_experiments.sh
+bash scripts/run_real_ssd_experiments.sh
+bash scripts/generate_report.sh
+```
 
-### 图 2：Correction Block 数量与加速比
-
-- 横轴：Correction Block Number
-- 纵轴：Speedup
-
-\[
-	ext{Speedup}
-=
-rac{T_{Baseline}}{T_{CASS}}
-\]
-
-### 图 3：Ready Block 数量与 Overlap Ratio
-
-- 横轴：Ready Block Number
-- 纵轴：Overlap Ratio
-
-### 图 4：额外开销分解
-
-展示：
-
-- Kernel Launch
-- State Save / Restore
-- Online Merge
-- Synchronization
-- Scheduling
+其中真实 SSD 实验暂未完成时，脚本必须明确退出并提示缺失依赖，不能静默跳过。
 
 ---
 
-## 11. 最终结论需要回答的问题
+## 14. 最终需要回答的问题
 
-实验结束后，需要明确回答：
+最终报告必须明确回答：
 
-1. CASS 在什么条件下有效？
-2. CASS 在什么条件下反而变慢？
-3. Ready Block 需要达到多少，才能覆盖 correction read？
-4. SSD 延迟多大时，CASS 收益最明显？
-5. Micro-batching 是否必要？
-6. 额外调度开销是否可控？
-7. CASS 能否带来真实端到端加速？
+1. CASS 是否有效？
+2. CASS 在哪些条件下有效？
+3. CASS 在哪些条件下反而变慢？
+4. Ready Block 计算最多能覆盖多少 correction read？
+5. micro-batching 是否必要？
+6. 主要额外开销来自哪里？
+7. Mock SSD 结果是否能在真实 NVMe SSD 上复现？
+8. CASS 是否能够带来真实端到端加速？
